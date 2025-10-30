@@ -1,0 +1,261 @@
+Description: Projeto Final - Infraestrutura AWS na Virginia 
+
+Parameters:
+  KeyName:
+    Description: Nome do Key Pair para acessar EC2 # Permite informar o nome da chave SSH na hora do deploy
+    Type: AWS::EC2::KeyPair::KeyName
+
+Resources:
+  # Criação da VPC, base para toda a rede privada e pública do projeto
+  VPC:
+    Type: "AWS::EC2::VPC"
+    Properties:
+      CidrBlock: "10.0.0.0/16"
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+
+  # Criação da Internet Gateway para acesso à internet
+  InternetGateway:
+    Type: "AWS::EC2::InternetGateway" 
+
+  # Associação da Internet Gateway com a VPC
+  AttachGateway:
+    Type: "AWS::EC2::VPCGatewayAttachment"
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Subnets para EC2 e Load Balancer se conectarem a usuários externos e ao EFS
+  PublicSubnet1:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: "10.0.1.0/24" # Subnet pública 1
+      AvailabilityZone: "us-east-1a" # Zona de disponibilidade A
+      MapPublicIpOnLaunch: true
+
+  PublicSubnet2:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: "10.0.2.0/24" # Subnet pública 2
+      AvailabilityZone: "us-east-1b" # Zona de disponibilidade B
+      MapPublicIpOnLaunch: true
+
+  # Security Group para as instâncias EC2
+  InstanceSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: "Acesso HTTP e SSH"
+      VpcId: !Ref VPC
+      SecurityGroupIngress: # Regras de entrada
+        - IpProtocol: "tcp"
+          FromPort: 22
+          ToPort: 22
+          CidrIp: "0.0.0.0/0" # Libera SSH para administração remota
+        - IpProtocol: "tcp"
+          FromPort: 80
+          ToPort: 80
+          CidrIp: "0.0.0.0/0" # Libera HTTP externo
+      SecurityGroupEgress: # Permite todo o tráfego de saída
+        - IpProtocol: "-1"
+          FromPort: 0
+          ToPort: 65535
+          CidrIp: "0.0.0.0/0"
+
+  # Security Group para o EFS
+  EFSSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: "Permite NFS (2049) da EC2 para EFS"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: "tcp"
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref InstanceSecurityGroup # Só EC2s da stack podem acessar NFS
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: "0.0.0.0/0"
+
+  # Load Balancer para distribuir tráfego entre as EC2s
+  LoadBalancer:
+    Type: "AWS::ElasticLoadBalancingV2::LoadBalancer"
+    Properties:
+      Name: "ProjetoFinalELB"
+      Subnets: [ !Ref PublicSubnet1, !Ref PublicSubnet2 ]
+      SecurityGroups: [ !Ref InstanceSecurityGroup ]
+      Scheme: "internet-facing"
+      Type: "application" # Application Load Balancer (ALB)
+
+  # Target Group para o Load Balancer direcionar tráfego às EC2s
+  TargetGroup:
+    Type: "AWS::ElasticLoadBalancingV2::TargetGroup"
+    Properties:
+      VpcId: !Ref VPC
+      Port: 80
+      Protocol: "HTTP"
+      TargetType: "instance"
+      HealthCheckPath: "/"
+      HealthCheckProtocol: "HTTP" # Faz healthcheck na raiz para garantir EC2s saudáveis
+
+  # Listener do Load Balancer para ouvir na porta 80 e direcionar ao Target Group
+  Listener:
+    Type: "AWS::ElasticLoadBalancingV2::Listener"
+    Properties:
+      DefaultActions:
+        - Type: "forward"
+          TargetGroupArn: !Ref TargetGroup
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: "HTTP"
+
+  # Launch Template para as instâncias EC2 com configuração de inicialização
+  LaunchTemplate:
+    Type: "AWS::EC2::LaunchTemplate"
+    Properties:
+      LaunchTemplateData:
+        ImageId: "ami-080e1f13689e07408" # AMI Ubuntu
+        InstanceType: "t3.micro"
+        IamInstanceProfile:
+         Arn: arn:aws:iam::908737804402:instance-profile/acesso-s3 # Instance Profile com permissão de acesso ao S3
+        SecurityGroupIds: [ !Ref InstanceSecurityGroup ]
+        KeyName: !Ref KeyName
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            apt-get update -y
+            apt-get install -y apache2 nfs-common awscli
+            systemctl start apache2
+            systemctl enable apache2
+            mkdir -p /mnt/efs
+            sleep 15
+            tries=0
+            until mount -t nfs4 -o nfsvers=4.1 ${MyEFS}.efs.us-east-1.amazonaws.com:/ /mnt/efs; do
+              sleep 10
+              ((tries++))
+              [ $tries -ge 6 ] && break
+            done
+            # Baixa os arquivos do S3 para o EFS
+            aws s3 cp s3://jogo-da-velha-projeto-final/jogo-da-velha /mnt/efs/ --recursive
+            rm -rf /var/www/html
+            ln -s /mnt/efs /var/www/html
+            # Garante que Apache lê todas as pastas/arquivos (e usuários podem baixar/executar)
+            find /mnt/efs -type d -exec chmod 755 {} \;
+            find /mnt/efs -type f -exec chmod 644 {} \;
+
+  # Auto Scaling Group para gerenciar a quantidade de instâncias EC2
+  AutoScalingGroup:
+    Type: "AWS::AutoScaling::AutoScalingGroup"
+    Properties:
+      VPCZoneIdentifier: [ !Ref PublicSubnet1, !Ref PublicSubnet2 ]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber # Usa a versão mais recente do Launch Template
+      MinSize: "2" # Mínimo de 2 instâncias
+      MaxSize: "4" # Máximo de 4 instâncias
+      DesiredCapacity: "2" # Começa com 2 instâncias
+      TargetGroupARNs: [ !Ref TargetGroup ]
+      HealthCheckType: "ELB"
+
+  # Política de escalonamento baseada em uso de CPU
+  ScaleUpPolicy:
+    Type: "AWS::AutoScaling::ScalingPolicy"
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: "TargetTrackingScaling"
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: "ASGAverageCPUUtilization"
+        TargetValue: 50.0 # Escala as EC2s conforme o uso de CPU
+
+  # Roteamento de rede (public route table e associações)
+  PublicRouteTable:
+    Type: "AWS::EC2::RouteTable"
+    Properties:
+      VpcId: !Ref VPC
+
+  # Rota padrão para a Internet Gateway
+  PublicRoute:
+    Type: "AWS::EC2::Route"
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: !Ref InternetGateway
+
+  # Associações das subnets públicas com a route table
+  PublicSubnet1RouteTableAssociation:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # Banco de dados relacional MySQL, protegido em subnets públicas
+  MyDBSubnetGroup:
+    Type: "AWS::RDS::DBSubnetGroup"
+    Properties:
+      DBSubnetGroupDescription: "Grupo de subnets para o RDS"
+      SubnetIds:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+
+  # Security Group para o RDS, permitindo acesso apenas da aplicação
+  MyDBSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: "Security Group RDS"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: "tcp"
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref InstanceSecurityGroup # Só a aplicação acessa o banco
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: "0.0.0.0/0"
+
+  # Instância do RDS MySQL
+  MyDBInstance:
+    Type: "AWS::RDS::DBInstance"
+    Properties:
+      AllocatedStorage: "20"
+      DBInstanceClass: "db.t3.micro"
+      Engine: "mysql"
+      MasterUsername: "admin"
+      MasterUserPassword: "SenhaForte123"
+      DBSubnetGroupName: !Ref MyDBSubnetGroup
+      VPCSecurityGroups: [ !Ref MyDBSecurityGroup ]
+      PubliclyAccessible: true
+      MultiAZ: false
+
+  # EFS (sistema de arquivos compartilhado) e seus mount targets nas subnets públicas
+  MyEFS:
+    Type: "AWS::EFS::FileSystem"
+    Properties:
+      Encrypted: false
+
+  # Mount Targets do EFS em ambas as subnets públicas
+  MyEFSMountTarget1:
+    Type: "AWS::EFS::MountTarget"
+    Properties:
+      FileSystemId: !Ref MyEFS
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroups: [ !Ref EFSSecurityGroup ]
+
+  MyEFSMountTarget2:
+    Type: "AWS::EFS::MountTarget"
+    Properties:
+      FileSystemId: !Ref MyEFS
+      SubnetId: !Ref PublicSubnet2
+      SecurityGroups: [ !Ref EFSSecurityGroup ]
+
+Outputs:
+  LoadBalancerDNS:
+    Description: "DNS do Load Balancer"
+    Value: !GetAtt LoadBalancer.DNSName
